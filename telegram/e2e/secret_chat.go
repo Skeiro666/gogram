@@ -1,5 +1,4 @@
 // Copyright (c) 2025 @AmarnathCJD
-// Secret Chat manager for E2E encrypted chats
 
 package e2e
 
@@ -9,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -18,11 +18,10 @@ import (
 )
 
 const (
-	CurrentLayer = 73 // MTProto Secret Chat Layer 73
-	MinLayer     = 46 // Minimum supported layer
+	CurrentLayer = 73
+	MinLayer     = 46
 )
 
-// SecretChat represents an active secret chat session
 type SecretChat struct {
 	ID              int32
 	AccessHash      int64
@@ -30,59 +29,51 @@ type SecretChat struct {
 	AdminID         int64
 	SharedKey       []byte
 	KeyFingerprint  int64
-	Layer           int32  // Remote party's layer
-	InSeqNo         int32  // Incoming sequence number
-	OutSeqNo        int32  // Outgoing sequence number
-	TTL             int32  // Default TTL for messages
-	IsOriginator    bool   // Whether we initiated the chat
-	State           string // "requested", "accepted", "ready"
-	DH              *DH    // Diffie-Hellman instance
+	Layer           int32
+	InSeqNoCounter  int32
+	OutSeqNoCounter int32
+	TTL             int32
+	IsOriginator    bool
+	State           string
+	DH              *DH
 	CreatedAt       time.Time
 	LastMessageTime time.Time
 
-	// Perfect Forward Secrecy
-	MessageCount int32     // Messages encrypted with current key
-	KeyCreatedAt time.Time // When current key was created
-	PendingRekey bool      // Whether rekey is in progress
+	MessageCount int32
+	KeyCreatedAt time.Time
+	PendingRekey bool
 
 	mu sync.RWMutex
 }
 
-// SecretChatManager manages all secret chats
 type SecretChatManager struct {
 	chats map[int32]*SecretChat
 	mu    sync.RWMutex
 }
 
-// NewSecretChatManager creates a new secret chat manager
 func NewSecretChatManager() *SecretChatManager {
 	return &SecretChatManager{
 		chats: make(map[int32]*SecretChat),
 	}
 }
 
-// CreateSecretChat creates a new secret chat (as originator)
-func (m *SecretChatManager) CreateSecretChat(chatID int32, userID int64, prime []byte, g int32) (*SecretChat, []byte, error) {
+func (m *SecretChatManager) CreateSecretChat(chatID int32, userID int64, prime []byte, g int32, extraEntropy []byte) (*SecretChat, []byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Create DH instance
 	dh, err := NewDH(prime, g)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create DH: %w", err)
 	}
 
-	// Generate our key
-	if err := dh.GenerateKey(); err != nil {
+	if err := dh.GenerateKey(extraEntropy); err != nil {
 		return nil, nil, fmt.Errorf("failed to generate key: %w", err)
 	}
 
 	chat := &SecretChat{
 		ID:           chatID,
 		UserID:       userID,
-		Layer:        MinLayer, // Start with minimum layer
-		InSeqNo:      0,
-		OutSeqNo:     0,
+		Layer:        MinLayer,
 		TTL:          0,
 		IsOriginator: true,
 		State:        "requested",
@@ -96,33 +87,24 @@ func (m *SecretChatManager) CreateSecretChat(chatID int32, userID int64, prime [
 	return chat, dh.GA.Bytes(), nil
 }
 
-// AcceptSecretChat accepts a secret chat request (as responder)
-func (m *SecretChatManager) AcceptSecretChat(chatID int32, accessHash int64, userID int64, adminID int64, gA []byte, prime []byte, g int32) (*SecretChat, []byte, int64, error) {
+func (m *SecretChatManager) AcceptSecretChat(chatID int32, accessHash int64, userID int64, adminID int64, ourSelfID int64, gA []byte, prime []byte, g int32, extraEntropy []byte) (*SecretChat, []byte, int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Create DH instance
 	dh, err := NewDH(prime, g)
 	if err != nil {
 		return nil, nil, 0, fmt.Errorf("failed to create DH: %w", err)
 	}
 
-	// Generate our key
-	if err := dh.GenerateKey(); err != nil {
+	if err := dh.GenerateKey(extraEntropy); err != nil {
 		return nil, nil, 0, fmt.Errorf("failed to generate key: %w", err)
 	}
 
-	// Compute shared key
 	if err := dh.ComputeSharedKey(gA); err != nil {
 		return nil, nil, 0, fmt.Errorf("failed to compute shared key: %w", err)
 	}
 
-	// Compute key fingerprint
 	fingerprint := ComputeKeyFingerprint(dh.SharedKey)
-
-	// Debug logging
-	fmt.Printf("RESPONDER: Computed shared key (first 32 bytes): %x\n", dh.SharedKey[:32])
-	fmt.Printf("RESPONDER: Key fingerprint: %d\n", fingerprint)
 
 	chat := &SecretChat{
 		ID:              chatID,
@@ -132,11 +114,9 @@ func (m *SecretChatManager) AcceptSecretChat(chatID int32, accessHash int64, use
 		SharedKey:       dh.SharedKey,
 		KeyFingerprint:  fingerprint,
 		Layer:           MinLayer,
-		InSeqNo:         0,
-		OutSeqNo:        0,
 		TTL:             0,
 		IsOriginator:    false,
-		State:           "ready", // Responder has shared key immediately, so state is ready
+		State:           "ready",
 		DH:              dh,
 		CreatedAt:       time.Now(),
 		KeyCreatedAt:    time.Now(),
@@ -148,8 +128,7 @@ func (m *SecretChatManager) AcceptSecretChat(chatID int32, accessHash int64, use
 	return chat, dh.GB.Bytes(), fingerprint, nil
 }
 
-// CompleteKeyExchange completes the key exchange (for originator after receiving g_b)
-func (m *SecretChatManager) CompleteKeyExchange(chatID int32, gB []byte, fingerprint int64) error {
+func (m *SecretChatManager) CompleteKeyExchange(chatID int32, gB []byte, fingerprint int64, ourSelfID int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -161,36 +140,24 @@ func (m *SecretChatManager) CompleteKeyExchange(chatID int32, gB []byte, fingerp
 	chat.mu.Lock()
 	defer chat.mu.Unlock()
 
-	// Compute shared key using our private 'a' and received 'g_b'
-	// key = g_b^a mod p
 	if err := chat.DH.ComputeSharedKey(gB); err != nil {
 		return fmt.Errorf("failed to compute shared key: %w", err)
 	}
 
-	// Verify fingerprint matches what responder computed
-	// Responder computed: key = g_a^b mod p
-	// We computed: key = g_b^a mod p
-	// These should be equal: g^(ab) mod p
 	expectedFingerprint := ComputeKeyFingerprint(chat.DH.SharedKey)
-
-	// Debug logging
-	fmt.Printf("ORIGINATOR: Computed shared key (first 32 bytes): %x\n", chat.DH.SharedKey[:32])
-	fmt.Printf("ORIGINATOR: Our fingerprint: %d\n", expectedFingerprint)
-	fmt.Printf("ORIGINATOR: Received fingerprint: %d\n", fingerprint)
-
 	if expectedFingerprint != fingerprint {
 		return fmt.Errorf("key fingerprint mismatch: expected %d, got %d", expectedFingerprint, fingerprint)
 	}
 
 	chat.SharedKey = chat.DH.SharedKey
 	chat.KeyFingerprint = fingerprint
+	chat.AdminID = ourSelfID
 	chat.State = "ready"
 	chat.LastMessageTime = time.Now()
 
 	return nil
 }
 
-// GetSecretChat retrieves a secret chat by ID
 func (m *SecretChatManager) GetSecretChat(chatID int32) (*SecretChat, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -203,7 +170,6 @@ func (m *SecretChatManager) GetSecretChat(chatID int32) (*SecretChat, error) {
 	return chat, nil
 }
 
-// EncryptMessage encrypts a message for a secret chat
 func (chat *SecretChat) EncryptMessage(plaintext []byte) (msgKey []byte, encrypted []byte, err error) {
 	chat.mu.Lock()
 	defer chat.mu.Unlock()
@@ -212,26 +178,21 @@ func (chat *SecretChat) EncryptMessage(plaintext []byte) (msgKey []byte, encrypt
 		return nil, nil, errors.New("secret chat not ready")
 	}
 
-	// Check if we need to rekey
 	if chat.ShouldRekey() {
 		chat.PendingRekey = true
-		// Note: Actual rekeying should be triggered by the application
 	}
 
-	// Encrypt using MTProto 2.0
 	msgKey, encrypted, err = aes.EncryptMessageMTProto(chat.SharedKey, plaintext, chat.IsOriginator)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Increment message counter
 	chat.MessageCount++
 	chat.LastMessageTime = time.Now()
 
 	return msgKey, encrypted, nil
 }
 
-// DecryptMessage decrypts a message from a secret chat
 func (chat *SecretChat) DecryptMessage(msgKey []byte, encrypted []byte) (plaintext []byte, err error) {
 	chat.mu.Lock()
 	defer chat.mu.Unlock()
@@ -240,50 +201,84 @@ func (chat *SecretChat) DecryptMessage(msgKey []byte, encrypted []byte) (plainte
 		return nil, errors.New("secret chat not ready")
 	}
 
-	// Decrypt using MTProto 2.0
-	plaintext, err = aes.DecryptMessageMTProto(chat.SharedKey, msgKey, encrypted, chat.IsOriginator)
+	plaintext, err = aes.DecryptMessageMTProto(chat.SharedKey, msgKey, encrypted, !chat.IsOriginator)
 	if err != nil {
 		return nil, err
 	}
 
-	// Increment message counter
 	chat.MessageCount++
 	chat.LastMessageTime = time.Now()
 
 	return plaintext, nil
 }
 
-// ShouldRekey determines if we should initiate rekeying
-// Rekey if: more than 100 messages OR key older than 1 week (and at least 1 message sent)
 func (chat *SecretChat) ShouldRekey() bool {
 	if chat.PendingRekey {
 		return false
 	}
-
-	// More than 100 messages
 	if chat.MessageCount >= 100 {
 		return true
 	}
-
-	// Key older than 1 week and at least 1 message sent
 	if time.Since(chat.KeyCreatedAt) > 7*24*time.Hour && chat.MessageCount > 0 {
 		return true
 	}
-
 	return false
 }
 
-// GetNextSeqNo returns the next outgoing sequence number
-func (chat *SecretChat) GetNextSeqNo() int32 {
+// NextOutSeqNo returns the next wire-format outgoing seq_no.
+//
+// The core.telegram.org/api/end-to-end/seq_no page documents the *opposite*
+// parity convention from what every actual client (tdlib, tdesktop,
+// MadelineProto) uses. Going by tdlib's SecretChatActor.cpp the wire formula
+// is `(counter+1)*2 - 1 - x` where x=0 for the creator, x=1 for the
+// responder, i.e.:
+//
+//	creator   out_seq_no = 1, 3, 5, ...   (ODD)
+//	responder out_seq_no = 0, 2, 4, ...   (EVEN)
+//
+// The peer's validator rejects mismatched parity silently, which manifested
+// as Telegram-Android dropping our messages and cancelling the chat.
+func (chat *SecretChat) NextOutSeqNo() int32 {
 	chat.mu.Lock()
 	defer chat.mu.Unlock()
 
-	seqNo := chat.OutSeqNo
-	chat.OutSeqNo++
-	return seqNo
+	chat.OutSeqNoCounter++
+	x := int32(0)
+	if !isCreator(chat) {
+		x = 1
+	}
+	return chat.OutSeqNoCounter*2 - 1 - x
 }
 
-// UpdateLayer updates the remote party's layer
+// CurrentInSeqNo returns the wire-format InSeqNo to send with a message.
+//
+//	creator   in_seq_no = 2*received + 0   (EVEN)
+//	responder in_seq_no = 2*received + 1   (ODD)
+//
+// (Mirror of NextOutSeqNo's parity, matches tdlib's check
+// `in_seq_no % 2 == auth_state_.x`.)
+func (chat *SecretChat) CurrentInSeqNo() int32 {
+	chat.mu.RLock()
+	defer chat.mu.RUnlock()
+
+	x := int32(0)
+	if !isCreator(chat) {
+		x = 1
+	}
+	return 2*chat.InSeqNoCounter + x
+}
+
+// RecordIncomingSeqNo increments the receive counter after a successful decrypt.
+func (chat *SecretChat) RecordIncomingSeqNo() {
+	chat.mu.Lock()
+	defer chat.mu.Unlock()
+	chat.InSeqNoCounter++
+}
+
+func isCreator(chat *SecretChat) bool {
+	return chat.IsOriginator
+}
+
 func (chat *SecretChat) UpdateLayer(layer int32) {
 	chat.mu.Lock()
 	defer chat.mu.Unlock()
@@ -293,32 +288,24 @@ func (chat *SecretChat) UpdateLayer(layer int32) {
 	}
 }
 
-// GenerateRandomID generates a random message ID
 func GenerateRandomID() (int64, error) {
-	bytes := make([]byte, 8)
-	_, err := rand.Read(bytes)
-	if err != nil {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
 		return 0, err
 	}
-
-	// Convert bytes to int64
-	randomID := int64(0)
-	for i := 0; i < 8; i++ {
-		randomID = (randomID << 8) | int64(bytes[i])
-	}
-
-	return randomID, nil
+	return int64(binary.BigEndian.Uint64(b[:])), nil
 }
 
-// RemoveSecretChat removes a secret chat
 func (m *SecretChatManager) RemoveSecretChat(chatID int32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	delete(m.chats, chatID)
+	if chat, ok := m.chats[chatID]; ok {
+		zeroize(chat)
+		delete(m.chats, chatID)
+	}
 }
 
-// UpdateChatID updates a chat's ID (used when server assigns actual ID)
 func (m *SecretChatManager) UpdateChatID(oldID, newID int32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -330,15 +317,32 @@ func (m *SecretChatManager) UpdateChatID(oldID, newID int32) {
 	}
 }
 
-// Close closes a secret chat
 func (m *SecretChatManager) Close(chatID int32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	delete(m.chats, chatID)
+	if chat, ok := m.chats[chatID]; ok {
+		zeroize(chat)
+		delete(m.chats, chatID)
+	}
 }
 
-// GetAllChats returns all active secret chats
+func zeroize(chat *SecretChat) {
+	chat.mu.Lock()
+	defer chat.mu.Unlock()
+	for i := range chat.SharedKey {
+		chat.SharedKey[i] = 0
+	}
+	chat.SharedKey = nil
+	if chat.DH != nil {
+		for i := range chat.DH.SharedKey {
+			chat.DH.SharedKey[i] = 0
+		}
+		chat.DH.SharedKey = nil
+		chat.DH.A = nil
+	}
+}
+
 func (m *SecretChatManager) GetAllChats() []*SecretChat {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -351,10 +355,7 @@ func (m *SecretChatManager) GetAllChats() []*SecretChat {
 	return chats
 }
 
-// SerializeDecryptedMessage serializes a DecryptedMessage for encryption
-// It wraps the message in a DecryptedMessageLayer with the specified layer version
 func SerializeDecryptedMessage(msg DecryptedMessage, layer int32, inSeqNo, outSeqNo int32) ([]byte, error) {
-	// Wrap message in layer
 	layeredMsg := &DecryptedMessageLayer{
 		RandomBytes: utils.RandomBytes(15),
 		Layer:       layer,
@@ -362,26 +363,21 @@ func SerializeDecryptedMessage(msg DecryptedMessage, layer int32, inSeqNo, outSe
 		OutSeqNo:    outSeqNo,
 		Message:     msg,
 	}
-
 	return tl.Marshal(layeredMsg)
 }
 
-// DeserializeDecryptedMessage deserializes a DecryptedMessage from decrypted data
 func DeserializeDecryptedMessage(data []byte) (*DecryptedMessageLayer, error) {
 	obj, err := tl.DecodeUnknownObject(data, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode decrypted message layer: %w", err)
 	}
-
 	layeredMsg, ok := obj.(*DecryptedMessageLayer)
 	if !ok {
 		return nil, fmt.Errorf("decoded object is not DecryptedMessageLayer")
 	}
-
 	return layeredMsg, nil
 }
 
-// SerializeDecryptedMessageService serializes a DecryptedMessageService
 func SerializeDecryptedMessageService(msg *DecryptedMessageService, layer int32, inSeqNo, outSeqNo int32) ([]byte, error) {
 	layeredMsg := &DecryptedMessageLayer{
 		RandomBytes: utils.RandomBytes(15),
@@ -390,41 +386,31 @@ func SerializeDecryptedMessageService(msg *DecryptedMessageService, layer int32,
 		OutSeqNo:    outSeqNo,
 		Message:     msg,
 	}
-
 	return tl.Marshal(layeredMsg)
 }
 
-// EncryptedFileKey holds the encryption parameters for a file
 type EncryptedFileKey struct {
-	Key         []byte // 256-bit AES key
-	IV          []byte // 256-bit initialization vector
-	Fingerprint int32  // 32-bit key fingerprint
+	Key         []byte
+	IV          []byte
+	Fingerprint int32
 }
 
-// GenerateFileEncryptionKey generates a random key and IV for file encryption
-// Returns key, IV, and fingerprint
 func GenerateFileEncryptionKey() (*EncryptedFileKey, error) {
-	// Generate 256-bit (32 bytes) random key
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		return nil, fmt.Errorf("failed to generate key: %w", err)
 	}
 
-	// Generate 256-bit (32 bytes) random IV
 	iv := make([]byte, 32)
 	if _, err := rand.Read(iv); err != nil {
 		return nil, fmt.Errorf("failed to generate IV: %w", err)
 	}
 
-	// Compute fingerprint: md5(key + iv), then XOR first and second half
-	// digest = md5(key + iv)
-	// fingerprint = substr(digest, 0, 4) XOR substr(digest, 4, 4)
 	h := md5.New()
 	h.Write(key)
 	h.Write(iv)
 	digest := h.Sum(nil)
 
-	// XOR first 4 bytes with second 4 bytes
 	fingerprint := binary.LittleEndian.Uint32(digest[0:4]) ^ binary.LittleEndian.Uint32(digest[4:8])
 
 	return &EncryptedFileKey{
@@ -434,7 +420,6 @@ func GenerateFileEncryptionKey() (*EncryptedFileKey, error) {
 	}, nil
 }
 
-// EncryptFile encrypts file data using AES-256-IGE with the provided key and IV
 func EncryptFile(data []byte, key, iv []byte) ([]byte, error) {
 	if len(key) != 32 {
 		return nil, fmt.Errorf("key must be 32 bytes, got %d", len(key))
@@ -443,7 +428,6 @@ func EncryptFile(data []byte, key, iv []byte) ([]byte, error) {
 		return nil, fmt.Errorf("IV must be 32 bytes, got %d", len(iv))
 	}
 
-	// Pad data to 16-byte boundary if needed
 	paddingLen := 0
 	if len(data)%16 != 0 {
 		paddingLen = 16 - (len(data) % 16)
@@ -452,13 +436,11 @@ func EncryptFile(data []byte, key, iv []byte) ([]byte, error) {
 	paddedData := make([]byte, len(data)+paddingLen)
 	copy(paddedData, data)
 	if paddingLen > 0 {
-		// Add random padding
 		if _, err := rand.Read(paddedData[len(data):]); err != nil {
 			return nil, fmt.Errorf("failed to generate padding: %w", err)
 		}
 	}
 
-	// Encrypt using AES-256-IGE
 	cipher, err := aes.NewCipher(key, iv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cipher: %w", err)
@@ -472,7 +454,92 @@ func EncryptFile(data []byte, key, iv []byte) ([]byte, error) {
 	return encrypted, nil
 }
 
-// DecryptFile decrypts file data using AES-256-IGE with the provided key and IV
+// EncryptFileStream encrypts src into dst using AES-256-IGE with the given
+// key/IV, padding the trailing partial block with random bytes so that the
+// total output length is a multiple of 16. It buffers at most ~64 KiB at a
+// time and is safe for arbitrarily large inputs.
+//
+// totalSize must be the exact number of plaintext bytes available on src; it
+// is used to compute the final padding length. Pass -1 if unknown, and the
+// stream will be drained first (less memory-efficient).
+func EncryptFileStream(dst io.Writer, src io.Reader, key, iv []byte, totalSize int64) (int64, error) {
+	if len(key) != 32 {
+		return 0, fmt.Errorf("key must be 32 bytes, got %d", len(key))
+	}
+	if len(iv) != 32 {
+		return 0, fmt.Errorf("IV must be 32 bytes, got %d", len(iv))
+	}
+
+	cipher, err := aes.NewCipher(key, iv)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create cipher: %w", err)
+	}
+
+	const chunkSize = 64 * 1024 // multiple of 16
+
+	var written, readTotal int64
+	tail := make([]byte, 0, 16)
+
+	for {
+		inBuf := make([]byte, chunkSize)
+		n, err := io.ReadFull(src, inBuf)
+		if n > 0 {
+			readTotal += int64(n)
+		}
+		aligned := n
+		atEOF := err == io.ErrUnexpectedEOF || err == io.EOF
+		if atEOF {
+			aligned = (n / 16) * 16
+		} else if err != nil {
+			return written, fmt.Errorf("read source: %w", err)
+		}
+
+		if aligned > 0 {
+			outBuf := make([]byte, aligned)
+			if err := cipher.DoAES256IGEencrypt(inBuf[:aligned], outBuf); err != nil {
+				return written, fmt.Errorf("encrypt block: %w", err)
+			}
+			if _, err := dst.Write(outBuf); err != nil {
+				return written, fmt.Errorf("write encrypted: %w", err)
+			}
+			written += int64(aligned)
+		}
+
+		if atEOF {
+			tail = append(tail, inBuf[aligned:n]...)
+			break
+		}
+	}
+
+	if totalSize >= 0 && readTotal != totalSize {
+		return written, fmt.Errorf("source size mismatch: declared %d, read %d", totalSize, readTotal)
+	}
+
+	pad := 0
+	if len(tail)%16 != 0 {
+		pad = 16 - (len(tail) % 16)
+	}
+	if pad > 0 || len(tail) > 0 {
+		final := make([]byte, len(tail)+pad)
+		copy(final, tail)
+		if pad > 0 {
+			if _, err := rand.Read(final[len(tail):]); err != nil {
+				return written, fmt.Errorf("generate padding: %w", err)
+			}
+		}
+		out := make([]byte, len(final))
+		if err := cipher.DoAES256IGEencrypt(final, out); err != nil {
+			return written, fmt.Errorf("encrypt final block: %w", err)
+		}
+		if _, err := dst.Write(out); err != nil {
+			return written, fmt.Errorf("write final: %w", err)
+		}
+		written += int64(len(out))
+	}
+
+	return written, nil
+}
+
 func DecryptFile(encryptedData []byte, key, iv []byte, originalSize int) ([]byte, error) {
 	if len(key) != 32 {
 		return nil, fmt.Errorf("key must be 32 bytes, got %d", len(key))
@@ -481,7 +548,6 @@ func DecryptFile(encryptedData []byte, key, iv []byte, originalSize int) ([]byte
 		return nil, fmt.Errorf("IV must be 32 bytes, got %d", len(iv))
 	}
 
-	// Decrypt using AES-256-IGE
 	cipher, err := aes.NewCipher(key, iv)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cipher: %w", err)
@@ -492,7 +558,6 @@ func DecryptFile(encryptedData []byte, key, iv []byte, originalSize int) ([]byte
 		return nil, fmt.Errorf("failed to decrypt: %w", err)
 	}
 
-	// Remove padding if original size is known
 	if originalSize > 0 && originalSize <= len(decrypted) {
 		return decrypted[:originalSize], nil
 	}
@@ -500,7 +565,6 @@ func DecryptFile(encryptedData []byte, key, iv []byte, originalSize int) ([]byte
 	return decrypted, nil
 }
 
-// VerifyFileFingerprint verifies the fingerprint of a file encryption key
 func VerifyFileFingerprint(key, iv []byte, fingerprint int32) bool {
 	h := md5.New()
 	h.Write(key)

@@ -13,6 +13,8 @@ func init() {
 		&SetClientDHParamsParams{},
 		&PingParams{},
 		&PingDelayDisconnectParams{},
+		&HttpWaitParams{},
+		&GetFutureSaltsParams{},
 		&ResPQ{},
 		&PQInnerData{},
 		&PQInnerDataTempDc{},

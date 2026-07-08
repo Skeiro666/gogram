@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/rsa"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"regexp"
@@ -46,10 +45,23 @@ type clientData struct {
 	sleepThresholdMs int
 	albumWaitTime    int64
 	botAcc           bool
+	meMu             sync.RWMutex
 	me               *UserObj
 	commandPrefixes  string
 	proxy            Proxy
 	disableGapFetch  bool
+}
+
+func (c *Client) getMe() *UserObj {
+	c.clientData.meMu.RLock()
+	defer c.clientData.meMu.RUnlock()
+	return c.clientData.me
+}
+
+func (c *Client) setMe(u *UserObj) {
+	c.clientData.meMu.Lock()
+	c.clientData.me = u
+	c.clientData.meMu.Unlock()
 }
 
 // Client is the main struct of the library
@@ -76,6 +88,16 @@ type DeviceConfig struct {
 	LangPack       string    // Language pack identifier (e.g., "ios", "android")
 	Params         JsonValue // Additional JSON parameters for init connection
 }
+
+type TransportType = mtproto.TransportType
+
+const (
+	TransportTCP          = mtproto.TransportTCP
+	TransportWebSocket    = mtproto.TransportWebSocket
+	TransportWebSocketTLS = mtproto.TransportWebSocketTLS
+	TransportHTTP         = mtproto.TransportHTTP
+	TransportHTTPS        = mtproto.TransportHTTPS
+)
 
 type ClientConfig struct {
 	AppID            int32                // Telegram API ID from my.telegram.org
@@ -109,9 +131,10 @@ type ClientConfig struct {
 	ErrorHandler     func(err error) bool // Called on request errors; return true to retry
 	Timeout          int                  // TCP connection timeout in seconds (default: 60)
 	ReqTimeout       int                  // RPC request timeout in seconds (default: 60)
-	UseWebSocket     bool                 // Use WebSocket transport instead of TCP
-	UseWebSocketTLS  bool                 // Use secure WebSocket (wss://)
+	Transport        TransportType        // Transport variant (TCP, WebSocket, HTTP, etc.) — default TCP
+	HTTPPath         string               // HTTP request path (default "/api"; only used for HTTP/HTTPS)
 	EnablePFS        bool                 // Enable Perfect Forward Secrecy with temp auth keys
+	PFSKeyLifetime   int32                // Lifetime (seconds) for PFS temp key; 0 = 24h
 	DisableGapFetch  bool                 // Disable automatic gap filling, only fetch difference on UpdatesTooLong/UpdateChannelTooLong
 }
 
@@ -197,9 +220,10 @@ func (c *Client) setupMTProto(config ClientConfig) error {
 		ErrorHandler:    config.ErrorHandler,
 		Timeout:         config.Timeout,
 		ReqTimeout:      config.ReqTimeout,
-		UseWebSocket:    config.UseWebSocket,
-		UseWebSocketTLS: config.UseWebSocketTLS,
+		Transport:       config.Transport,
+		HTTPPath:        config.HTTPPath,
 		EnablePFS:       config.EnablePFS,
+		PFSKeyLifetime:  config.PFSKeyLifetime,
 		OnMigration: func() {
 			c.InitialRequest()
 		},
@@ -232,7 +256,7 @@ func (c *Client) clientWarnings(config ClientConfig) error {
 	}
 	if !doesSessionFileExist(config.Session) && config.StringSession == "" && (c.AppID() == 0 || c.AppHash() == "") {
 		if c.AppID() == 0 {
-			log.Print("app id is empty, fetch from api.telegram.org? (y/n): ")
+			fmt.Print("app id is empty, fetch from api.telegram.org? (y/n): ")
 			if !utils.AskForConfirmation() {
 				return errors.New("your app id is empty, please provide it")
 			} else {
@@ -459,15 +483,15 @@ func (c *Client) SetAppHash(appHash string) {
 }
 
 func (c *Client) Me() *UserObj {
-	if c.clientData.me == nil {
-		me, err := c.GetMe()
-		if err != nil {
-			return &UserObj{}
-		}
-		c.clientData.me = me
+	if cached := c.getMe(); cached != nil {
+		return cached
 	}
-
-	return c.clientData.me
+	me, err := c.GetMe()
+	if err != nil {
+		return &UserObj{}
+	}
+	c.setMe(me)
+	return me
 }
 
 type ExSenders struct {
@@ -854,6 +878,7 @@ func (c *Client) Terminate() error {
 func (c *Client) Idle() {
 	sigchan := make(chan os.Signal, 1)
 	signal.Notify(sigchan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigchan)
 
 	select {
 	case <-sigchan:
@@ -923,9 +948,10 @@ func (c *Client) CheckErr(_ any, err error) error {
 	return err
 }
 
+var rpcErrorRegex = regexp.MustCompile(`\[(.*)\] (.*) \(code (\d+)\)`)
+
 func (c *Client) ToRpcError(err error) *RpcError {
-	regex := regexp.MustCompile(`\[(.*)\] (.*) \(code (\d+)\)`)
-	matches := regex.FindStringSubmatch(err.Error())
+	matches := rpcErrorRegex.FindStringSubmatch(err.Error())
 	if len(matches) != 4 {
 		return nil
 	}

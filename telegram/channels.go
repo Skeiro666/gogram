@@ -79,13 +79,17 @@ func (c *Client) JoinChannel(channel any) (*Channel, error) {
 				return nil, err
 			}
 
-			if updates, ok := result.(*UpdatesObj); ok {
-				c.Cache.UpdatePeersToCache(updates.Users, updates.Chats)
-				for _, chat := range updates.Chats {
-					if ch, ok := chat.(*Channel); ok {
-						return ch, nil
+			if res, ok := result.(*MessagesChatInviteJoinResultOk); ok {
+				if updates, ok := res.Updates.(*UpdatesObj); ok {
+					c.Cache.UpdatePeersToCache(updates.Users, updates.Chats)
+					for _, chat := range updates.Chats {
+						if ch, ok := chat.(*Channel); ok {
+							return ch, nil
+						}
 					}
 				}
+			} else if _, ok := result.(*MessagesChatInviteJoinResultWebView); ok {
+				return nil, errors.New("join via webview is not supported")
 			}
 			return nil, nil
 		}
@@ -269,8 +273,10 @@ func (c *Client) GetChatMembers(chatID any, Opts ...*ParticipantOptions) ([]*Par
 	var totalCount int32
 
 	for {
-		remaining := opts.Limit - int32(fetched)
-		reqLimit = min(remaining, 200)
+		reqLimit = 200
+		if opts.Limit > 0 {
+			reqLimit = min(opts.Limit-int32(fetched), 200)
+		}
 
 		participants, err := c.ChannelsGetParticipants(&InputChannelObj{ChannelID: chat.ChannelID, AccessHash: chat.AccessHash}, opts.Filter, reqOffset, reqLimit, 0)
 		if err != nil {
@@ -295,7 +301,8 @@ func (c *Client) GetChatMembers(chatID any, Opts ...*ParticipantOptions) ([]*Par
 			fetched++
 		}
 
-		if fetched >= opts.Limit || len(cParts.Participants) == 0 {
+		if len(cParts.Participants) < int(reqLimit) || (opts.Limit > 0 && fetched >= opts.Limit) {
+			totalCount = cParts.Count
 			break
 		}
 
@@ -307,14 +314,41 @@ func (c *Client) GetChatMembers(chatID any, Opts ...*ParticipantOptions) ([]*Par
 	return participantsList, totalCount, nil
 }
 
+// GetChatMembersCount returns the total participant count for the given channel or group
+func (c *Client) GetChatMembersCount(chatID any) (int32, error) {
+	peer, err := c.ResolvePeer(chatID)
+	if err != nil {
+		return 0, err
+	}
+	chat, ok := peer.(*InputPeerChannel)
+	if !ok {
+		return 0, fmt.Errorf("peer is not a channel, but %T", peer)
+	}
+	resp, err := c.MakeRequest(&ChannelsGetParticipantsParams{
+		Channel: &InputChannelObj{ChannelID: chat.ChannelID, AccessHash: chat.AccessHash},
+		Filter:  &ChannelParticipantsSearch{},
+		Limit:   0,
+	})
+	if err != nil {
+		return 0, err
+	}
+	switch r := resp.(type) {
+	case *ChannelsChannelParticipantsObj:
+		return r.Count, nil
+	default:
+		return 0, fmt.Errorf("unexpected response: %T", resp)
+	}
+}
+
 func (c *Client) IterChatMembers(chatID any, Opts ...*ParticipantOptions) (<-chan *Participant, <-chan error) {
 	ch := make(chan *Participant)
-	errCh := make(chan error)
+	errCh := make(chan error, 1)
 
 	var peerToAct, err = c.ResolvePeer(chatID)
 	if err != nil {
 		errCh <- err
 		close(ch)
+		close(errCh)
 		return ch, errCh
 	}
 
@@ -322,6 +356,7 @@ func (c *Client) IterChatMembers(chatID any, Opts ...*ParticipantOptions) (<-cha
 	if !ok {
 		errCh <- fmt.Errorf("peer is not a channel, but %T", peerToAct)
 		close(ch)
+		close(errCh)
 		return ch, errCh
 	}
 
@@ -351,31 +386,12 @@ func (c *Client) IterChatMembers(chatID any, Opts ...*ParticipantOptions) (<-cha
 		}
 
 		for {
-			if opts.Limit == -1 {
-				req.Limit = 0
-				resp, err := c.MakeRequest(req)
-				if err != nil {
-					errCh <- err
-					return
-				}
-
-				switch resp := resp.(type) {
-				case *ChannelsChannelParticipantsObj:
-					if resp.Count == 0 {
-						return
-					}
-					opts.Limit = resp.Count
-				case *ChannelsChannelParticipantsNotModified:
-				default:
-				}
-
-				continue
-			}
-
-			remaining := opts.Limit - int32(fetched)
 			perReqLimit := int32(200)
-			if remaining < perReqLimit {
-				perReqLimit = remaining
+			if opts.Limit > 0 {
+				remaining := opts.Limit - int32(fetched)
+				if remaining < perReqLimit {
+					perReqLimit = remaining
+				}
 			}
 			req.Limit = perReqLimit
 
@@ -999,5 +1015,234 @@ func (c *Client) RevokeInvite(channel any, invite string) error {
 		Link:    invite,
 		Revoked: true,
 	})
+	return err
+}
+
+type CreateTopicOptions struct {
+	IconColor   int32
+	IconEmojiID int64
+	SendAs      any
+}
+
+func (c *Client) EnableForum(channel any, tabs bool) error {
+	ch, err := c.GetSendableChannel(channel)
+	if err != nil {
+		return err
+	}
+	_, err = c.ChannelsToggleForum(ch, true, tabs)
+	return err
+}
+
+func (c *Client) DisableForum(channel any) error {
+	ch, err := c.GetSendableChannel(channel)
+	if err != nil {
+		return err
+	}
+	_, err = c.ChannelsToggleForum(ch, false, false)
+	return err
+}
+
+func (c *Client) CreateTopic(channel any, title string, opts ...*CreateTopicOptions) (int32, error) {
+	if title == "" {
+		return 0, errors.New("title is required")
+	}
+	opt := getVariadic(opts, &CreateTopicOptions{})
+	peer, err := c.ResolvePeer(channel)
+	if err != nil {
+		return 0, err
+	}
+	params := &MessagesCreateForumTopicParams{
+		Peer:        peer,
+		Title:       title,
+		IconColor:   opt.IconColor,
+		IconEmojiID: opt.IconEmojiID,
+		RandomID:    GenerateRandomLong(),
+	}
+	if opt.SendAs != nil {
+		sa, err := c.ResolvePeer(opt.SendAs)
+		if err != nil {
+			return 0, fmt.Errorf("resolve send_as: %w", err)
+		}
+		params.SendAs = sa
+	}
+	upd, err := c.MessagesCreateForumTopic(params)
+	if err != nil {
+		return 0, err
+	}
+	return extractTopicID(upd), nil
+}
+
+func extractTopicID(upd Updates) int32 {
+	scan := func(updates []Update) int32 {
+		for _, u := range updates {
+			switch v := u.(type) {
+			case *UpdateNewChannelMessage:
+				if m, ok := v.Message.(*MessageService); ok {
+					if _, ok := m.Action.(*MessageActionTopicCreate); ok {
+						return m.ID
+					}
+				}
+			case *UpdateNewMessage:
+				if m, ok := v.Message.(*MessageService); ok {
+					if _, ok := m.Action.(*MessageActionTopicCreate); ok {
+						return m.ID
+					}
+				}
+			}
+		}
+		return 0
+	}
+	switch v := upd.(type) {
+	case *UpdatesObj:
+		return scan(v.Updates)
+	case *UpdateShort:
+		return scan([]Update{v.Update})
+	}
+	return 0
+}
+
+type EditTopicOptions struct {
+	Title       string
+	IconEmojiID int64
+	Closed      *bool
+	Hidden      *bool
+}
+
+func (c *Client) EditTopic(channel any, topicID int32, opts *EditTopicOptions) error {
+	if opts == nil {
+		return errors.New("opts required")
+	}
+	peer, err := c.ResolvePeer(channel)
+	if err != nil {
+		return err
+	}
+	params := &MessagesEditForumTopicParams{
+		Peer:        peer,
+		TopicID:     topicID,
+		Title:       opts.Title,
+		IconEmojiID: opts.IconEmojiID,
+	}
+	if opts.Closed != nil {
+		params.Closed = *opts.Closed
+	}
+	if opts.Hidden != nil {
+		params.Hidden = *opts.Hidden
+	}
+	_, err = c.MessagesEditForumTopic(params)
+	return err
+}
+
+func (c *Client) RenameTopic(channel any, topicID int32, title string) error {
+	return c.EditTopic(channel, topicID, &EditTopicOptions{Title: title})
+}
+
+func (c *Client) CloseTopic(channel any, topicID int32) error {
+	closed := true
+	return c.EditTopic(channel, topicID, &EditTopicOptions{Closed: &closed})
+}
+
+func (c *Client) ReopenTopic(channel any, topicID int32) error {
+	open := false
+	return c.EditTopic(channel, topicID, &EditTopicOptions{Closed: &open})
+}
+
+func (c *Client) HideTopic(channel any, topicID int32) error {
+	hidden := true
+	return c.EditTopic(channel, topicID, &EditTopicOptions{Hidden: &hidden})
+}
+
+func (c *Client) UnhideTopic(channel any, topicID int32) error {
+	hidden := false
+	return c.EditTopic(channel, topicID, &EditTopicOptions{Hidden: &hidden})
+}
+
+func (c *Client) PinTopic(channel any, topicID int32) error {
+	peer, err := c.ResolvePeer(channel)
+	if err != nil {
+		return err
+	}
+	_, err = c.MessagesUpdatePinnedForumTopic(peer, topicID, true)
+	return err
+}
+
+func (c *Client) UnpinTopic(channel any, topicID int32) error {
+	peer, err := c.ResolvePeer(channel)
+	if err != nil {
+		return err
+	}
+	_, err = c.MessagesUpdatePinnedForumTopic(peer, topicID, false)
+	return err
+}
+
+func (c *Client) ReorderPinnedTopics(channel any, order []int32, force bool) error {
+	peer, err := c.ResolvePeer(channel)
+	if err != nil {
+		return err
+	}
+	_, err = c.MessagesReorderPinnedForumTopics(force, peer, order)
+	return err
+}
+
+func (c *Client) DeleteTopic(channel any, topicID int32) error {
+	peer, err := c.ResolvePeer(channel)
+	if err != nil {
+		return err
+	}
+	_, err = c.MessagesDeleteTopicHistory(peer, topicID)
+	return err
+}
+
+type ListTopicsOptions struct {
+	Query       string
+	Limit       int32
+	OffsetID    int32
+	OffsetDate  int32
+	OffsetTopic int32
+}
+
+func (c *Client) ListTopics(channel any, opts ...*ListTopicsOptions) ([]ForumTopic, error) {
+	opt := getVariadic(opts, &ListTopicsOptions{})
+	peer, err := c.ResolvePeer(channel)
+	if err != nil {
+		return nil, err
+	}
+	if opt.Limit <= 0 {
+		opt.Limit = 100
+	}
+	resp, err := c.MessagesGetForumTopics(&MessagesGetForumTopicsParams{
+		Peer:        peer,
+		Q:           opt.Query,
+		OffsetDate:  opt.OffsetDate,
+		OffsetID:    opt.OffsetID,
+		OffsetTopic: opt.OffsetTopic,
+		Limit:       opt.Limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Topics, nil
+}
+
+func (c *Client) GetTopics(channel any, topicIDs ...int32) ([]ForumTopic, error) {
+	if len(topicIDs) == 0 {
+		return nil, errors.New("at least one topic id required")
+	}
+	peer, err := c.ResolvePeer(channel)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.MessagesGetForumTopicsByID(peer, topicIDs)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Topics, nil
+}
+
+func (c *Client) ViewForumAsMessages(channel any, asMessages bool) error {
+	ch, err := c.GetSendableChannel(channel)
+	if err != nil {
+		return err
+	}
+	_, err = c.ChannelsToggleViewForumAsMessages(ch, asMessages)
 	return err
 }

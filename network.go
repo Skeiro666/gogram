@@ -37,9 +37,8 @@ func (m *MTProto) sendPacketWithMsgID(request tl.Object, msgID int64, expectedTy
 
 	resp := m.getRespChannel()
 	if isNullableResponse(request) {
-		go func() {
-			resp <- &objects.Null{}
-		}()
+		resp = make(chan tl.Object, 1)
+		resp <- &objects.Null{}
 	} else {
 		m.responseChannels.Add(int(msgID), resp)
 	}
@@ -135,6 +134,8 @@ func (m *MTProto) getRespChannel() chan tl.Object {
 func isNotContentRelated(t tl.Object) bool {
 	switch t.(type) {
 	case *objects.PingParams,
+		*objects.PingDelayDisconnectParams,
+		*utils.PingParams,
 		*objects.MsgsAck,
 		*objects.GzipPacked:
 		return true
@@ -145,7 +146,7 @@ func isNotContentRelated(t tl.Object) bool {
 
 func isNullableResponse(t tl.Object) bool {
 	switch t.(type) {
-	case *objects.Pong, *objects.MsgsAck:
+	case *objects.Pong, *objects.MsgsAck, *utils.PingParams, *objects.PingParams, *objects.PingDelayDisconnectParams:
 		return true
 	default:
 		return false
@@ -172,7 +173,12 @@ func (m *MTProto) GetServerSalt() int64 {
 }
 
 // GetAuthKey returns the current auth key used for message encryption.
+// In PFS mode, once a temp key is available, it's used for all traffic.
+// The permanent key is retained on m.authKey for re-binding.
 func (m *MTProto) GetAuthKey() []byte {
+	if m.enablePFS && len(m.tempAuthKey) > 0 {
+		return m.tempAuthKey
+	}
 	return m.authKey
 }
 

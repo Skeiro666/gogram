@@ -1,5 +1,4 @@
 // Copyright (c) 2025 @AmarnathCJD
-// Secret Chat methods for the Telegram Client
 
 package telegram
 
@@ -16,7 +15,25 @@ import (
 	"github.com/amarnathcjd/gogram/telegram/e2e"
 )
 
-// RequestSecretChat requests a new secret chat with a user
+func mixRandom(serverRandom []byte) []byte {
+	if len(serverRandom) == 0 {
+		return nil
+	}
+	mixed := make([]byte, len(serverRandom))
+	client := utils.RandomBytes(len(serverRandom))
+	for i := range serverRandom {
+		mixed[i] = serverRandom[i] ^ client[i]
+	}
+	return mixed
+}
+
+func (c *Client) selfUserID() int64 {
+	if me := c.Me(); me != nil {
+		return me.ID
+	}
+	return 0
+}
+
 func (c *Client) RequestSecretChat(userID any) (*EncryptedChatObj, error) {
 	dhConfig, err := c.MessagesGetDhConfig(0, 256)
 	if err != nil {
@@ -25,25 +42,20 @@ func (c *Client) RequestSecretChat(userID any) (*EncryptedChatObj, error) {
 
 	var prime []byte
 	var g int32
-	var random []byte
+	var serverRandom []byte
 
 	switch config := dhConfig.(type) {
 	case *MessagesDhConfigObj:
 		prime = config.P
 		g = config.G
-		random = config.Random
+		serverRandom = config.Random
 	case *MessagesDhConfigNotModified:
 		return nil, fmt.Errorf("DH config not modified, need to use cached parameters")
 	default:
 		return nil, fmt.Errorf("unexpected DH config type: %T", dhConfig)
 	}
 
-	if len(random) > 0 {
-		clientRandom := utils.RandomBytes(len(random))
-		for i := range random {
-			random[i] ^= clientRandom[i]
-		}
-	}
+	entropy := mixRandom(serverRandom)
 
 	if c.secretChats == nil {
 		c.secretChats = e2e.NewSecretChatManager()
@@ -60,13 +72,11 @@ func (c *Client) RequestSecretChat(userID any) (*EncryptedChatObj, error) {
 	}
 
 	tempChatID := int32(randomId)
-	chat, gA, err := c.secretChats.CreateSecretChat(tempChatID, user.(*InputUserObj).UserID, prime, g)
+	chat, gA, err := c.secretChats.CreateSecretChat(tempChatID, user.(*InputUserObj).UserID, prime, g, entropy)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create secret chat: %w", err)
 	}
 
-	// Both clients must check that g_a > 1 and g_a < p-1
-	// and that 2^{2048-64} < g_a < p - 2^{2048-64}
 	if !e2e.IsValidGAOrGB(chat.DH.GA, chat.DH.Prime) {
 		return nil, fmt.Errorf("generated invalid g_a")
 	}
@@ -115,32 +125,25 @@ func (c *Client) AcceptSecretChat(chat InputEncryptedChat, gA []byte) error {
 
 	var prime []byte
 	var g int32
-	var random []byte
+	var serverRandom []byte
 
 	switch config := dhConfig.(type) {
 	case *MessagesDhConfigObj:
 		prime = config.P
 		g = config.G
-		random = config.Random
+		serverRandom = config.Random
 	case *MessagesDhConfigNotModified:
 		return fmt.Errorf("DH config not modified, need to use cached parameters")
 	default:
 		return fmt.Errorf("unexpected DH config type: %T", dhConfig)
 	}
 
-	if len(random) > 0 {
-		clientRandom := utils.RandomBytes(len(random))
-		for i := range random {
-			random[i] ^= clientRandom[i]
-		}
-	}
+	entropy := mixRandom(serverRandom)
 
 	if c.secretChats == nil {
 		c.secretChats = e2e.NewSecretChatManager()
 	}
 
-	// Both clients must check that g_a > 1 and g_a < p-1
-	// and that 2^{2048-64} < g_a < p - 2^{2048-64}
 	primeInt := new(big.Int).SetBytes(prime)
 	gAInt := new(big.Int).SetBytes(gA)
 
@@ -148,14 +151,17 @@ func (c *Client) AcceptSecretChat(chat InputEncryptedChat, gA []byte) error {
 		return fmt.Errorf("received invalid g_a from originator")
 	}
 
+	selfID := c.selfUserID()
 	chatAc, gB, fingerprint, err := c.secretChats.AcceptSecretChat(
 		chat.ChatID,
 		chat.AccessHash,
 		0,
-		0,
+		selfID,
+		selfID,
 		gA,
 		prime,
 		g,
+		entropy,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to accept secret chat: %w", err)
@@ -177,7 +183,6 @@ func (c *Client) AcceptSecretChat(chat InputEncryptedChat, gA []byte) error {
 	return err
 }
 
-// SendSecretMessage sends an encrypted message in a secret chat
 func (c *Client) SendSecretMessage(chatID int32, message string, ttl int32) (MessagesSentEncryptedMessage, error) {
 	chat, err := c.secretChats.GetSecretChat(chatID)
 	if err != nil {
@@ -195,10 +200,10 @@ func (c *Client) SendSecretMessage(chatID int32, message string, ttl int32) (Mes
 		Message:  message,
 	}
 
-	inSeqNo := chat.InSeqNo
-	outSeqNo := chat.GetNextSeqNo()
+	inSeqNo := chat.CurrentInSeqNo()
+	outSeqNo := chat.NextOutSeqNo()
 
-	serialized, err := e2e.SerializeDecryptedMessage(msg, chat.Layer, inSeqNo, outSeqNo)
+	serialized, err := e2e.SerializeDecryptedMessage(msg, e2e.CurrentLayer, inSeqNo, outSeqNo)
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize message: %w", err)
 	}
@@ -227,8 +232,31 @@ func (c *Client) SendSecretMessage(chatID int32, message string, ttl int32) (Mes
 	return resp, nil
 }
 
-// SendSecretChatLayerNotification sends a layer notification to the secret chat
+// SendSecretChatLayerNotification announces our supported layer to the peer.
+// Per spec this must be the FIRST decrypted message exchanged on the channel.
 func (c *Client) SendSecretChatLayerNotification(chatID int32) (MessagesSentEncryptedMessage, error) {
+	return c.sendSecretService(chatID, &e2e.DecryptedMessageActionNotifyLayer{Layer: e2e.CurrentLayer})
+}
+
+// SendSecretAction sends a typing indicator to a secret chat.
+func (c *Client) SendSecretAction(chatID int32, action e2e.SendMessageAction) (bool, error) {
+	chat, err := c.secretChats.GetSecretChat(chatID)
+	if err != nil {
+		return false, fmt.Errorf("failed to get secret chat: %w", err)
+	}
+
+	typing := true
+	if _, ok := action.(*e2e.SendMessageCancelAction); ok {
+		typing = false
+	}
+
+	return c.MessagesSetEncryptedTyping(&InputEncryptedChat{
+		ChatID:     chat.ID,
+		AccessHash: chat.AccessHash,
+	}, typing)
+}
+
+func (c *Client) sendSecretService(chatID int32, action e2e.DecryptedMessageAction) (MessagesSentEncryptedMessage, error) {
 	chat, err := c.secretChats.GetSecretChat(chatID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get secret chat: %w", err)
@@ -239,18 +267,14 @@ func (c *Client) SendSecretChatLayerNotification(chatID int32) (MessagesSentEncr
 		return nil, fmt.Errorf("failed to generate random ID: %w", err)
 	}
 
-	action := &e2e.DecryptedMessageActionNotifyLayer{
-		Layer: e2e.CurrentLayer,
-	}
-
 	serviceMsg := &e2e.DecryptedMessageService{
 		RandomID: randomID,
 		Action:   action,
 	}
 
-	inSeqNo := chat.InSeqNo
-	outSeqNo := chat.GetNextSeqNo()
-	serialized, err := e2e.SerializeDecryptedMessageService(serviceMsg, chat.Layer, inSeqNo, outSeqNo)
+	inSeqNo := chat.CurrentInSeqNo()
+	outSeqNo := chat.NextOutSeqNo()
+	serialized, err := e2e.SerializeDecryptedMessageService(serviceMsg, e2e.CurrentLayer, inSeqNo, outSeqNo)
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize service message: %w", err)
 	}
@@ -294,24 +318,33 @@ func (c *Client) DiscardSecretChat(chatID int32, revoke ...bool) error {
 	return nil
 }
 
-// handleSecretChatUpdate processes incoming secret chat updates and dispatches to handlers
+// handleSecretChatUpdate processes incoming secret chat updates and dispatches
+// to user handlers. The dispatcher read-lock is held only long enough to copy
+// the handler list — releasing it before invoking user code prevents the user
+// callback from deadlocking the update dispatcher if it makes RPC calls
+// (the RPC reply needs the dispatcher write-lock to fire its update).
 func (c *Client) handleSecretChatUpdate(update Update) {
 	c.dispatcher.RLock()
-	defer c.dispatcher.RUnlock()
-
+	var snapshot []*e2eHandle
 	for _, handlers := range c.dispatcher.e2eHandles {
-		for _, handler := range handlers {
-			handler.Handler(update, c)
-		}
+		snapshot = append(snapshot, handlers...)
+	}
+	c.dispatcher.RUnlock()
+
+	for _, h := range snapshot {
+		h.Handler(update, c)
 	}
 }
 
-// HandleSecretChatUpdate handles incoming secret chat updates
+// HandleSecretChatUpdate handles incoming secret chat updates.
+// User-level callbacks are dispatched AFTER the internal state machine has
+// completed processing, so a handler observing EncryptedChatObj sees a chat
+// that is already in the "ready" state and safe to send on.
 func (c *Client) HandleSecretChatUpdate(update Update) error {
 	if c.secretChats == nil {
 		c.secretChats = e2e.NewSecretChatManager()
 	}
-	go c.handleSecretChatUpdate(update)
+	defer func() { go c.handleSecretChatUpdate(update) }()
 	switch u := update.(type) {
 	case *UpdateEncryption:
 		switch chat := u.Chat.(type) {
@@ -349,8 +382,9 @@ func (c *Client) HandleSecretChatUpdate(update Update) error {
 
 				if err := c.secretChats.CompleteKeyExchange(
 					chat.ID,
-					chat.GAOrB, // This is g_b
+					chat.GAOrB,
 					chat.KeyFingerprint,
+					c.selfUserID(),
 				); err != nil {
 					c.Log.Error("failed to complete key exchange (fingerprint mismatch?), discarding chat:", err)
 					_, _ = c.MessagesDiscardEncryption(true, chat.ID)
@@ -359,13 +393,8 @@ func (c *Client) HandleSecretChatUpdate(update Update) error {
 				}
 
 				existingChat.AccessHash = chat.AccessHash
-				_, err = c.SendSecretChatLayerNotification(chat.ID)
-				if err != nil {
+				if _, err = c.SendSecretChatLayerNotification(chat.ID); err != nil {
 					c.Log.Error("failed to send layer notification:", err)
-				}
-				_, err = c.SendSecretMessage(chat.ID, "Secret chat established!", 0)
-				if err != nil {
-					c.Log.Error("failed to send secret message:", err)
 				}
 			} else {
 				// The chat should have been created in either RequestSecretChat or AcceptSecretChat
@@ -374,34 +403,45 @@ func (c *Client) HandleSecretChatUpdate(update Update) error {
 
 		case *EncryptedChatDiscarded:
 			c.secretChats.Close(chat.ID)
-			c.Log.Info("secret chat discarded:", chat.ID)
+			c.Log.Info("secret chat discarded: %d", chat.ID)
 
 		default:
 			return fmt.Errorf("unknown encrypted chat type: %T", chat)
+		}
+
+	case *UpdateNewEncryptedMessage:
+		if msg, ok := u.Message.(*EncryptedMessageObj); ok {
+			if chat, err := c.secretChats.GetSecretChat(msg.ChatID); err == nil {
+				if _, _, err := c.decryptSecretMessage(msg.ChatID, msg.Bytes); err != nil {
+					c.Log.Debug("eager decrypt failed for chat %d: %v", msg.ChatID, err)
+				} else {
+					chat.RecordIncomingSeqNo()
+				}
+			}
 		}
 	}
 
 	return nil
 }
 
-// DecryptSecretMessage decrypts an incoming secret chat message
 func (c *Client) DecryptSecretMessage(chatID int32, encryptedData []byte) (*e2e.DecryptedMessageLayer, error) {
+	layer, _, err := c.decryptSecretMessage(chatID, encryptedData)
+	return layer, err
+}
+
+func (c *Client) decryptSecretMessage(chatID int32, encryptedData []byte) (*e2e.DecryptedMessageLayer, bool, error) {
 	if len(encryptedData) < 24 {
-		return nil, fmt.Errorf("encrypted data too short")
+		return nil, false, fmt.Errorf("encrypted data too short")
 	}
 
 	chat, err := c.secretChats.GetSecretChat(chatID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get secret chat: %w", err)
+		return nil, false, fmt.Errorf("failed to get secret chat: %w", err)
 	}
 
-	fingerprint := int64(0)
-	for i := 0; i < 8; i++ {
-		fingerprint |= int64(encryptedData[i]) << (i * 8)
-	}
-
+	fingerprint := int64(binary.LittleEndian.Uint64(encryptedData[:8]))
 	if fingerprint != chat.KeyFingerprint {
-		return nil, fmt.Errorf("key fingerprint mismatch")
+		return nil, false, fmt.Errorf("key fingerprint mismatch")
 	}
 
 	msgKey := encryptedData[8:24]
@@ -409,18 +449,20 @@ func (c *Client) DecryptSecretMessage(chatID int32, encryptedData []byte) (*e2e.
 
 	plaintext, err := chat.DecryptMessage(msgKey, encrypted)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt message: %w", err)
+		return nil, false, fmt.Errorf("failed to decrypt message: %w", err)
 	}
 	layer, err := e2e.DeserializeDecryptedMessage(plaintext)
 	if err != nil {
-		return nil, fmt.Errorf("failed to deserialize message: %w", err)
+		return nil, false, fmt.Errorf("failed to deserialize message: %w", err)
 	}
 
+	layerBumped := false
 	if layer.Layer > chat.Layer {
 		chat.UpdateLayer(layer.Layer)
+		layerBumped = true
 	}
 
-	return layer, nil
+	return layer, layerBumped, nil
 }
 
 // SecretFileOptions options for sending encrypted files in secret chats
@@ -437,23 +479,142 @@ type SecretFileOptions struct {
 	PartSize   int                     // Upload chunk size (default: 512KB)
 }
 
-// SendSecretFile sends an encrypted file to a secret chat
-// The file is encrypted with a one-time key that is sent in the message body
-func (c *Client) SendSecretFile(chatID int32, filePath string, opts *SecretFileOptions) error {
+// SendSecretFile sends an encrypted file to a secret chat.
+//
+// source may be:
+//   - string: path to a local file (streamed from disk, encrypted, uploaded)
+//   - []byte: raw file bytes already in memory (encrypted, uploaded)
+//   - *DocumentObj or *MessageMediaDocument that already lives on Telegram's
+//     cloud: sent as DecryptedMessageMediaExternalDocument — no re-download,
+//     no re-encrypt, no re-upload. The recipient fetches the document directly
+//     from Telegram's CDN. Used automatically for stickers, GIFs, and other
+//     already-public cloud documents.
+//   - other Telegram media accepted by DownloadMedia (e.g. *MessageMediaPhoto,
+//     forwarded user files): downloaded to a temp file, stream-encrypted with
+//     a fresh key, uploaded into the secret chat. Memory use stays bounded
+//     regardless of file size.
+func (c *Client) SendSecretFile(chatID int32, source any, opts *SecretFileOptions) error {
 	if opts == nil {
 		opts = &SecretFileOptions{}
 	}
 
-	if opts.MimeType == "" {
-		opts.MimeType = MimeTypes.match(filePath)
+	var extDoc *DocumentObj
+	switch s := source.(type) {
+	case *DocumentObj:
+		extDoc = s
+	case *MessageMediaDocument:
+		if d, ok := s.Document.(*DocumentObj); ok {
+			extDoc = d
+		}
+	}
+	if extDoc != nil {
+		chat, err := c.secretChats.GetSecretChat(chatID)
+		if err != nil {
+			return fmt.Errorf("failed to get secret chat: %w", err)
+		}
+		mime := opts.MimeType
+		if mime == "" {
+			mime = extDoc.MimeType
+		}
+		attrs := opts.Attributes
+		if attrs == nil {
+			attrs = E2EAttrs(extDoc.Attributes)
+		}
+		randomID, err := e2e.GenerateRandomID()
+		if err != nil {
+			return fmt.Errorf("failed to generate random ID: %w", err)
+		}
+		msg := &e2e.DecryptedMessageObj{
+			RandomID: randomID,
+			TTL:      opts.TTL,
+			Message:  opts.Caption,
+			Media: &e2e.DecryptedMessageMediaExternalDocument{
+				ID:         extDoc.ID,
+				AccessHash: extDoc.AccessHash,
+				Date:       extDoc.Date,
+				MimeType:   mime,
+				Size:       int32(extDoc.Size),
+				Thumb:      &e2e.PhotoSizeEmpty{Type: ""},
+				DcID:       extDoc.DcID,
+				Attributes: attrs,
+			},
+		}
+		serialized, err := e2e.SerializeDecryptedMessage(msg, e2e.CurrentLayer, chat.CurrentInSeqNo(), chat.NextOutSeqNo())
+		if err != nil {
+			return fmt.Errorf("failed to serialize message: %w", err)
+		}
+		msgKey, encryptedMsg, err := chat.EncryptMessage(serialized)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt message: %w", err)
+		}
+		data := make([]byte, 8+16+len(encryptedMsg))
+		for i := range 8 {
+			data[i] = byte(chat.KeyFingerprint >> (i * 8))
+		}
+		copy(data[8:], msgKey)
+		copy(data[24:], encryptedMsg)
+		_, err = c.MessagesSendEncrypted(false, &InputEncryptedChat{
+			ChatID:     chat.ID,
+			AccessHash: chat.AccessHash,
+		}, randomID, data)
+		return err
 	}
 
-	fileData, err := os.ReadFile(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to read file: %w", err)
-	}
+	var plaintextPath string
+	var plaintextBytes []byte
+	var plaintextSize int64
+	var fileName string
+	var cleanup func()
 
-	fileName := GetFileName(filePath)
+	switch s := source.(type) {
+	case string:
+		st, err := os.Stat(s)
+		if err != nil {
+			return fmt.Errorf("failed to stat file: %w", err)
+		}
+		plaintextPath = s
+		plaintextSize = st.Size()
+		fileName = GetFileName(s)
+		if opts.MimeType == "" {
+			opts.MimeType = MimeTypes.match(s)
+		}
+	case []byte:
+		plaintextBytes = s
+		plaintextSize = int64(len(s))
+	default:
+		tmp, err := os.CreateTemp("", "gogram-e2e-src-*")
+		if err != nil {
+			return fmt.Errorf("create temp source file: %w", err)
+		}
+		tmp.Close()
+		tmpPath := tmp.Name()
+		cleanup = func() { os.Remove(tmpPath) }
+
+		if _, err := c.DownloadMedia(source, &DownloadOptions{FileName: tmpPath}); err != nil {
+			cleanup()
+			return fmt.Errorf("failed to download source media: %w", err)
+		}
+		st, err := os.Stat(tmpPath)
+		if err != nil {
+			cleanup()
+			return fmt.Errorf("stat downloaded media: %w", err)
+		}
+		plaintextPath = tmpPath
+		plaintextSize = st.Size()
+		fileName = GetFileName(source)
+		if opts.MimeType == "" {
+			if doc, ok := source.(*DocumentObj); ok {
+				opts.MimeType = doc.MimeType
+			} else if md, ok := source.(*MessageMediaDocument); ok {
+				if doc, ok := md.Document.(*DocumentObj); ok {
+					opts.MimeType = doc.MimeType
+				}
+			}
+		}
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
 
 	chat, err := c.secretChats.GetSecretChat(chatID)
 	if err != nil {
@@ -482,12 +643,16 @@ func (c *Client) SendSecretFile(chatID int32, filePath string, opts *SecretFileO
 		}
 	}
 
-	encryptedData, err := e2e.EncryptFile(fileData, fileKey.Key, fileKey.IV)
-	if err != nil {
-		return fmt.Errorf("failed to encrypt file: %w", err)
+	var inputFile InputEncryptedFile
+	if plaintextPath != "" {
+		inputFile, err = c.encryptAndUploadStream(plaintextPath, plaintextSize, fileKey, opts.PartSize)
+	} else {
+		encryptedData, encErr := e2e.EncryptFile(plaintextBytes, fileKey.Key, fileKey.IV)
+		if encErr != nil {
+			return fmt.Errorf("failed to encrypt file: %w", encErr)
+		}
+		inputFile, err = c.uploadEncryptedFile(encryptedData, opts.PartSize, fileKey.Fingerprint)
 	}
-
-	inputFile, err := c.uploadEncryptedFile(encryptedData, opts.PartSize, fileKey.Fingerprint)
 	if err != nil {
 		return fmt.Errorf("failed to upload file: %w", err)
 	}
@@ -515,7 +680,7 @@ func (c *Client) SendSecretFile(chatID int32, filePath string, opts *SecretFileO
 			ThumbW:     opts.ThumbW,
 			ThumbH:     opts.ThumbH,
 			MimeType:   opts.MimeType,
-			Size:       int64(len(fileData)),
+			Size:       plaintextSize,
 			Key:        fileKey.Key,
 			Iv:         fileKey.IV,
 			Attributes: attributes,
@@ -523,10 +688,10 @@ func (c *Client) SendSecretFile(chatID int32, filePath string, opts *SecretFileO
 		},
 	}
 
-	inSeqNo := chat.InSeqNo
-	outSeqNo := chat.GetNextSeqNo()
+	inSeqNo := chat.CurrentInSeqNo()
+	outSeqNo := chat.NextOutSeqNo()
 
-	serialized, err := e2e.SerializeDecryptedMessage(msg, chat.Layer, inSeqNo, outSeqNo)
+	serialized, err := e2e.SerializeDecryptedMessage(msg, e2e.CurrentLayer, inSeqNo, outSeqNo)
 	if err != nil {
 		return fmt.Errorf("failed to serialize message: %w", err)
 	}
@@ -555,6 +720,54 @@ func (c *Client) SendSecretFile(chatID int32, filePath string, opts *SecretFileO
 	})
 
 	return err
+}
+
+func (c *Client) encryptAndUploadStream(plaintextPath string, plaintextSize int64, fileKey *e2e.EncryptedFileKey, partSize int) (InputEncryptedFile, error) {
+	src, err := os.Open(plaintextPath)
+	if err != nil {
+		return nil, fmt.Errorf("open plaintext: %w", err)
+	}
+	defer src.Close()
+
+	ctTmp, err := os.CreateTemp("", "gogram-e2e-ct-*")
+	if err != nil {
+		return nil, fmt.Errorf("create temp ciphertext: %w", err)
+	}
+	ctPath := ctTmp.Name()
+	defer os.Remove(ctPath)
+
+	if _, err := e2e.EncryptFileStream(ctTmp, src, fileKey.Key, fileKey.IV, plaintextSize); err != nil {
+		ctTmp.Close()
+		return nil, fmt.Errorf("stream encrypt: %w", err)
+	}
+	if err := ctTmp.Close(); err != nil {
+		return nil, fmt.Errorf("close ciphertext: %w", err)
+	}
+
+	upload, err := c.UploadFile(ctPath, &UploadOptions{
+		ChunkSize: int32(partSize),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("upload ciphertext: %w", err)
+	}
+
+	switch file := upload.(type) {
+	case *InputFileBig:
+		return &InputEncryptedFileBigUploaded{
+			ID:             file.ID,
+			Parts:          file.Parts,
+			KeyFingerprint: fileKey.Fingerprint,
+		}, nil
+	case *InputFileObj:
+		return &InputEncryptedFileUploaded{
+			ID:             file.ID,
+			Parts:          file.Parts,
+			Md5Checksum:    file.Md5Checksum,
+			KeyFingerprint: fileKey.Fingerprint,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unexpected upload file type: %T", upload)
+	}
 }
 
 func (c *Client) uploadEncryptedFile(data []byte, partSize int, keyFingerprint int32) (InputEncryptedFile, error) {

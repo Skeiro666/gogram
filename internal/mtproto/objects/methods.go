@@ -146,6 +146,14 @@ func (*PingParams) CRC() uint32 {
 	return 0x7abe77ec
 }
 
+type GetFutureSaltsParams struct {
+	Num int32
+}
+
+func (*GetFutureSaltsParams) CRC() uint32 {
+	return 0xb921bd04
+}
+
 type PingDelayDisconnectParams struct {
 	PingID          int64
 	DisconnectDelay int32
@@ -153,6 +161,16 @@ type PingDelayDisconnectParams struct {
 
 func (*PingDelayDisconnectParams) CRC() uint32 {
 	return 0xf3427b8c
+}
+
+type HttpWaitParams struct {
+	MaxDelay  int32
+	WaitAfter int32
+	MaxWait   int32
+}
+
+func (*HttpWaitParams) CRC() uint32 {
+	return 0x9299359f
 }
 
 // ping_delay_disconnect
