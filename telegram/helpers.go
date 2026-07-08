@@ -1389,6 +1389,28 @@ func PackMessages(c *Client, messages []Message) []*NewMessage {
 	return packedMessages
 }
 
+// packMessageCustomFile builds file metadata for a message media object.
+// It recovers from panics caused by partially decoded media (e.g. DocumentEmpty).
+func packMessageCustomFile(c *Client, media MessageMedia) (file *CustomFile) {
+	defer func() {
+		if r := recover(); r != nil {
+			if c != nil {
+				c.Log.Warn("pack message file panic: %v", r)
+			}
+			file = nil
+		}
+	}()
+	if media == nil {
+		return nil
+	}
+	return &CustomFile{
+		FileID: PackBotFileID(media),
+		Name:   GetFileName(media),
+		Size:   GetFileSize(media),
+		Ext:    GetFileExt(media),
+	}
+}
+
 func packMessage(c *Client, message Message) *NewMessage {
 	var (
 		m = &NewMessage{}
@@ -1482,13 +1504,7 @@ func packMessage(c *Client, message Message) *NewMessage {
 
 	m.Peer = c.getInputPeer(m.Message.PeerID)
 	if m.IsMedia() {
-		FileID := PackBotFileID(m.Media())
-		m.File = &CustomFile{
-			FileID: FileID,
-			Name:   GetFileName(m.Media()),
-			Size:   GetFileSize(m.Media()),
-			Ext:    GetFileExt(m.Media()),
-		}
+		m.File = packMessageCustomFile(c, m.Media())
 	}
 	return m
 }
@@ -1843,4 +1859,3 @@ func (c *Client) JSON(object any, noindent ...bool) string {
 	}
 	return MarshalWithTypeName(object, indent)
 }
-
